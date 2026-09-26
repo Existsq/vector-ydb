@@ -30,7 +30,7 @@ fn parses_minimal_config() {
           codec: "json"
         "#,
     );
-    assert_eq!(config.codec, YdbTopicCodec::Auto);
+    assert_eq!(config.codec, YdbTopicCodec::Raw);
     assert!(matches!(config.auth, YdbAuthConfig::Anonymous));
     assert!(config.validate().is_ok());
 }

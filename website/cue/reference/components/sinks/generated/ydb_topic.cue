@@ -113,11 +113,20 @@ generated: components: sinks: ydb_topic: configuration: {
 			"""
 		required: false
 		type: string: {
-			default: "auto"
+			default: "raw"
 			enum: {
-				auto: "Pick the codec (`raw` or `gzip`) that produces the smallest payload, among those allowed by the topic."
+				auto: """
+					Pick the codec (`raw` or `gzip`) that produces the smallest payload, among those allowed by the topic.
+
+					Every message is compressed to compare the codecs, which costs as much CPU as `gzip`.
+					"""
 				gzip: "Compress messages with gzip."
-				raw:  "Write messages without compression."
+				raw: """
+					Write messages without compression.
+
+					Compression is applied to every message separately, so short messages, such as
+					log lines, barely shrink. Writing them uncompressed saves CPU.
+					"""
 			}
 		}
 	}

@@ -36,10 +36,15 @@ impl SinkBatchSettings for YdbTopicDefaultBatchSettings {
 #[serde(rename_all = "snake_case")]
 pub enum YdbTopicCodec {
     /// Pick the codec (`raw` or `gzip`) that produces the smallest payload, among those allowed by the topic.
-    #[default]
+    ///
+    /// Every message is compressed to compare the codecs, which costs as much CPU as `gzip`.
     Auto,
 
     /// Write messages without compression.
+    ///
+    /// Compression is applied to every message separately, so short messages, such as
+    /// log lines, barely shrink. Writing them uncompressed saves CPU.
+    #[default]
     Raw,
 
     /// Compress messages with gzip.

@@ -118,7 +118,8 @@ components: sinks: ydb_topic: {
 				Compression (`codec`) is applied to every message separately, so short messages
 				barely shrink: `gzip` saved less than 10% of the traffic on 200-byte log lines while
 				using about twice as much CPU as `raw`. `auto` compresses messages as well and costs
-				as much CPU as `gzip`. Prefer `raw` for short log lines.
+				as much CPU as `gzip`. This is why `raw` is the default; `gzip` pays off only for
+				large, repetitive messages.
 
 				Set `dashboard.enabled` to watch how batches fill up and which limit sends them.
 				"""
