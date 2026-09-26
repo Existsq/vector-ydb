@@ -7,7 +7,7 @@ env:
   YDB_ENDPOINT: grpc://ydb:2136/local
 
 matrix:
-  version: ["24.4"]
+  version: ["24.4", "26.3.1.16"]
 
 paths:
   - "src/sinks/ydb_topic/**"

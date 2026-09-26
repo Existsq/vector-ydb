@@ -192,7 +192,7 @@ async fn ydb_topic_static_auth_wrong_password() {
         .expect("sink should build");
     let error = healthcheck.await.expect_err("healthcheck should fail");
     assert!(
-        error.to_string().contains("Invalid password"),
+        error.to_string().contains("Unauthorized"),
         "unexpected error: {error}"
     );
 }
