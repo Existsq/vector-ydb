@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use futures::FutureExt;
 use snafu::Snafu;
@@ -13,10 +13,7 @@ use super::{
     service::{YdbTopicRetryLogic, YdbTopicService},
     sink::YdbTopicSink,
 };
-use crate::{
-    config::ValidatedSink,
-    sinks::{prelude::*, util::service::TowerRequestConfigDefaults},
-};
+use crate::{config::ValidatedSink, sinks::prelude::*};
 
 /// Batch defaults for the `ydb_topic` sink.
 #[derive(Clone, Copy, Debug, Default)]
@@ -27,18 +24,6 @@ impl SinkBatchSettings for YdbTopicDefaultBatchSettings {
     // YDB limits a single `StreamWrite` gRPC message to 64 MiB; stay well below it.
     const MAX_BYTES: Option<usize> = Some(8 * 1024 * 1024);
     const TIMEOUT_SECS: f64 = 1.0;
-}
-
-/// Request defaults for the `ydb_topic` sink.
-///
-/// A single in-flight request keeps the order of messages within the producer
-/// session, which is what YDB topic consumers (including `ydb-go-sdk` readers)
-/// usually rely on.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct YdbTopicTowerRequestConfigDefaults;
-
-impl TowerRequestConfigDefaults for YdbTopicTowerRequestConfigDefaults {
-    const CONCURRENCY: Concurrency = Concurrency::None;
 }
 
 /// Compression codec applied to messages written to the topic.
@@ -184,7 +169,7 @@ pub struct YdbTopicSinkConfig {
     pub batch: BatchConfig<YdbTopicDefaultBatchSettings>,
 
     #[serde(default)]
-    pub request: TowerRequestConfig<YdbTopicTowerRequestConfigDefaults>,
+    pub request: TowerRequestConfig,
 
     #[serde(
         default,
@@ -320,10 +305,16 @@ impl ValidatedSink for YdbTopicSinkConfig {
             request_settings,
         } = validated.clone();
 
-        let client = Arc::new(self.build_client(&endpoint).await?);
-        let healthcheck = healthcheck(Arc::clone(&client), self.topic.clone()).boxed();
+        let factory = ClientFactory {
+            config: self.clone(),
+            endpoint,
+        };
+        // Surface local problems, such as unreadable key or certificate files,
+        // right away. Connecting to YDB is deferred to the first request.
+        factory.builder()?;
 
-        let writer = YdbTopicService::new(client, self.writer_options());
+        let writer = YdbTopicService::new(factory, self.writer_options());
+        let healthcheck = healthcheck(writer.clone(), self.topic.clone()).boxed();
         let service = ServiceBuilder::new()
             .settings(request_settings, YdbTopicRetryLogic)
             .service(writer.clone());
@@ -351,16 +342,30 @@ impl YdbTopicSinkConfig {
             .codec_selector(self.codec.selection())
             .build()
     }
+}
 
-    async fn build_client(&self, endpoint: &ParsedEndpoint) -> crate::Result<Client> {
-        let mut builder = ClientBuilder::new_from_connection_string(self.endpoint.as_str())?;
+/// Creates YDB clients.
+///
+/// The YDB SDK runs endpoint discovery when a client is created, which fails
+/// if YDB is unreachable. Clients are therefore created lazily by the service,
+/// so that Vector starts even while YDB is down.
+pub(super) struct ClientFactory {
+    config: YdbTopicSinkConfig,
+    endpoint: ParsedEndpoint,
+}
 
-        let ca_file = self.tls.as_ref().and_then(|tls| tls.ca_file.as_ref());
+impl ClientFactory {
+    /// Prepares a client builder. Reads local files but does not connect to YDB.
+    fn builder(&self) -> crate::Result<ClientBuilder> {
+        let config = &self.config;
+        let mut builder = ClientBuilder::new_from_connection_string(config.endpoint.as_str())?;
+
+        let ca_file = config.tls.as_ref().and_then(|tls| tls.ca_file.as_ref());
         if let Some(ca_file) = ca_file {
             builder = builder.load_certificate(ca_file)?;
         }
 
-        builder = match &self.auth {
+        builder = match &config.auth {
             YdbAuthConfig::Anonymous => builder.with_credentials(AnonymousCredentials::new()),
             YdbAuthConfig::AccessToken { token } => {
                 builder.with_credentials(AccessTokenCredentials::from(token.inner()))
@@ -369,8 +374,8 @@ impl YdbTopicSinkConfig {
                 let mut credentials = StaticCredentials::new(
                     user.clone(),
                     password.inner().to_owned(),
-                    endpoint.endpoint.parse()?,
-                    endpoint.database.clone(),
+                    self.endpoint.endpoint.parse()?,
+                    self.endpoint.database.clone(),
                 );
                 if let Some(ca_file) = ca_file {
                     credentials = credentials.load_certificate(ca_file)?;
@@ -384,11 +389,17 @@ impl YdbTopicSinkConfig {
             YdbAuthConfig::Environment => builder.with_credentials(FromEnvCredentials::new()?),
         };
 
-        Ok(builder.build().await?)
+        Ok(builder)
+    }
+
+    /// Connects to YDB.
+    pub(super) async fn connect(&self) -> crate::Result<Client> {
+        Ok(self.builder()?.build().await?)
     }
 }
 
-async fn healthcheck(client: Arc<Client>, topic: String) -> crate::Result<()> {
+async fn healthcheck(service: YdbTopicService, topic: String) -> crate::Result<()> {
+    let client = service.client().await?;
     let options = DescribeTopicOptionsBuilder::default().build()?;
     client.topic_client().describe_topic(topic, options).await?;
     Ok(())

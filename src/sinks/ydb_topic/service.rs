@@ -1,34 +1,42 @@
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
+use futures::future::Shared;
 use snafu::Snafu;
-use tokio::sync::Mutex;
+use tokio::sync::{OnceCell, mpsc, oneshot};
+use tracing::Instrument;
 use ydb::{Client, TopicWriter, TopicWriterMessage, TopicWriterOptions, YdbError};
 
-use super::request_builder::YdbTopicMessage;
+use super::config::ClientFactory;
 use crate::sinks::prelude::*;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A batch of encoded events written to the topic as one message each.
 #[derive(Clone)]
 pub(super) struct YdbTopicRequest {
+    /// Identifies the request across retries.
+    id: u64,
     pub(super) messages: Vec<Bytes>,
     finalizers: EventFinalizers,
     metadata: RequestMetadata,
 }
 
 impl YdbTopicRequest {
-    pub(super) fn new(mut messages: Vec<YdbTopicMessage>) -> Self {
-        let metadata = RequestMetadata::from_batch(
-            messages
-                .iter()
-                .map(|message| message.get_metadata().clone()),
-        );
-        let finalizers = messages.take_finalizers();
-        let messages = messages.into_iter().map(|message| message.body).collect();
+    pub(super) fn new(
+        messages: Vec<Bytes>,
+        finalizers: EventFinalizers,
+        metadata: RequestMetadata,
+    ) -> Self {
         Self {
+            id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             messages,
             finalizers,
             metadata,
@@ -73,19 +81,17 @@ impl DriverResponse for YdbTopicResponse {
 
 #[derive(Debug, Snafu)]
 pub(super) enum YdbTopicError {
+    #[snafu(display("Failed to connect to YDB: {error}"))]
+    Connect { error: crate::Error },
+
     #[snafu(display("Failed to create YDB topic writer: {source}"))]
     CreateWriter { source: YdbError },
 
     #[snafu(display("Failed to write message to YDB topic: {source}"))]
     Write { source: YdbError },
-}
 
-impl YdbTopicError {
-    const fn source_error(&self) -> &YdbError {
-        match self {
-            Self::CreateWriter { source } | Self::Write { source } => source,
-        }
-    }
+    #[snafu(display("The YDB topic writer task has stopped"))]
+    Closed,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,7 +103,15 @@ impl RetryLogic for YdbTopicRetryLogic {
     type Response = YdbTopicResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
-        is_retriable(error.source_error())
+        match error {
+            YdbTopicError::Connect { error } => error
+                .downcast_ref::<YdbError>()
+                .is_none_or(is_retriable_connect_error),
+            YdbTopicError::CreateWriter { source } | YdbTopicError::Write { source } => {
+                is_retriable(source)
+            }
+            YdbTopicError::Closed => false,
+        }
     }
 }
 
@@ -120,9 +134,19 @@ const GRPC_ABORTED: i32 = 10;
 const GRPC_INTERNAL: i32 = 13;
 const GRPC_UNAVAILABLE: i32 = 14;
 
-/// Writes to a topic are always safe to retry: the writer is recreated after
-/// an error and, with a stable `producer_id`, YDB deduplicates messages by
-/// their sequence numbers.
+/// Connecting fails with a generic error when YDB is unreachable, so only
+/// errors explicitly reported by the server are treated as permanent.
+fn is_retriable_connect_error(error: &YdbError) -> bool {
+    match error {
+        YdbError::YdbStatusError(_) | YdbError::TransportGRPCStatus(_) => is_retriable(error),
+        _ => true,
+    }
+}
+
+/// Whether a failed write should be retried with a new write session.
+///
+/// Transient transport and server errors are retried; errors caused by the
+/// request itself (bad topic, permissions, unsupported codec) are not.
 pub(super) fn is_retriable(error: &YdbError) -> bool {
     match error {
         YdbError::TransportDial(_) | YdbError::Transport(_) | YdbError::DeadlineExceeded => true,
@@ -153,96 +177,235 @@ pub(super) fn is_retriable(error: &YdbError) -> bool {
     }
 }
 
-struct Inner {
-    client: Arc<Client>,
-    options: TopicWriterOptions,
-    writer: Mutex<Option<Arc<TopicWriter>>>,
+/// Acknowledgements of all messages of one request.
+type SharedAcks = Shared<BoxFuture<'static, Result<(), YdbError>>>;
+
+type EnqueueResult = Result<(u64, SharedAcks), YdbTopicError>;
+
+/// Requests whose messages are enqueued to a writer and are not confirmed yet.
+///
+/// Requests older than this many requests are assumed to be abandoned (their
+/// retries were exhausted) and are forgotten.
+const MAX_PENDING_REQUESTS: u64 = 10_000;
+
+/// Lazily connected YDB client, shared by the writer task and the healthcheck.
+struct LazyClient {
+    factory: ClientFactory,
+    client: OnceCell<Client>,
+}
+
+impl LazyClient {
+    async fn get(&self) -> Result<&Client, YdbTopicError> {
+        self.client
+            .get_or_try_init(|| self.factory.connect())
+            .await
+            .map_err(|error| YdbTopicError::Connect { error })
+    }
+}
+
+enum Command {
+    /// Enqueue the messages of a request to the writer.
+    Enqueue {
+        request_id: u64,
+        messages: Vec<Bytes>,
+        reply: oneshot::Sender<EnqueueResult>,
+    },
+    /// All acknowledgements of a request were received, or one of them failed.
+    Finished {
+        request_id: u64,
+        failed_generation: Option<u64>,
+    },
+    /// Close the write session gracefully.
+    Shutdown { reply: oneshot::Sender<()> },
 }
 
 /// Writes batches of messages to a YDB topic through a single long-lived
 /// write session.
 ///
-/// The write session is created lazily and recreated after any error, since
-/// the YDB topic writer does not recover from fatal errors by itself.
+/// The write session is owned by a background task. Requests are passed to it
+/// through a channel from `call`, which the driver invokes in request order, so
+/// batches are enqueued in order even with several requests in flight.
+///
+/// Requests are idempotent while the write session is alive: when a request
+/// times out, its messages stay in the writer and are still delivered, so a
+/// retry of the same request waits for their acknowledgements instead of
+/// writing the messages again.
 #[derive(Clone)]
 pub(super) struct YdbTopicService {
-    inner: Arc<Inner>,
+    commands: mpsc::UnboundedSender<Command>,
+    client: Arc<LazyClient>,
 }
 
 impl YdbTopicService {
-    pub(super) fn new(client: Arc<Client>, options: TopicWriterOptions) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                client,
-                options,
-                writer: Mutex::new(None),
-            }),
-        }
+    pub(super) fn new(factory: ClientFactory, options: TopicWriterOptions) -> Self {
+        let client = Arc::new(LazyClient {
+            factory,
+            client: OnceCell::new(),
+        });
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let task = WriterTask {
+            client: Arc::clone(&client),
+            options,
+            writer: None,
+            next_generation: 0,
+            pending: HashMap::new(),
+        };
+        tokio::spawn(task.run(receiver).in_current_span());
+        Self { commands, client }
     }
-}
 
-impl YdbTopicService {
+    /// Returns the YDB client, connecting on first use.
+    pub(super) async fn client(&self) -> Result<&Client, YdbTopicError> {
+        self.client.get().await
+    }
+
     /// Gracefully closes the write session, if any.
     ///
     /// Dropping a `TopicWriter` aborts its background tasks, so it is stopped
     /// explicitly once the sink has no more requests in flight.
     pub(super) async fn shutdown(&self) {
-        let writer = self.inner.writer.lock().await.take();
-        if let Some(writer) = writer.and_then(|writer| Arc::try_unwrap(writer).ok())
-            && let Err(error) = writer.stop().await
-        {
-            warn!(message = "Failed to gracefully close YDB topic writer.", %error);
+        let (reply, done) = oneshot::channel();
+        if self.commands.send(Command::Shutdown { reply }).is_ok() {
+            _ = done.await;
         }
     }
 }
 
-impl Inner {
-    async fn write(&self, messages: Vec<Bytes>) -> Result<(), YdbTopicError> {
-        // The lock is held while the batch is enqueued, so that the messages of
-        // a batch are contiguous in the topic even with concurrent requests.
-        let mut guard = self.writer.lock().await;
-        let writer = match guard.as_ref() {
-            Some(writer) => Arc::clone(writer),
+struct CurrentWriter {
+    generation: u64,
+    writer: TopicWriter,
+}
+
+struct PendingRequest {
+    generation: u64,
+    acks: SharedAcks,
+}
+
+struct WriterTask {
+    client: Arc<LazyClient>,
+    options: TopicWriterOptions,
+    writer: Option<CurrentWriter>,
+    next_generation: u64,
+    pending: HashMap<u64, PendingRequest>,
+}
+
+impl WriterTask {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
+        while let Some(command) = commands.recv().await {
+            match command {
+                Command::Enqueue {
+                    request_id,
+                    messages,
+                    reply,
+                } => {
+                    // The requester may be gone (for example after a timeout).
+                    // The messages are enqueued anyway, so that its retry finds them.
+                    _ = reply.send(self.enqueue(request_id, messages).await);
+                }
+                Command::Finished {
+                    request_id,
+                    failed_generation,
+                } => {
+                    self.pending.remove(&request_id);
+                    if let Some(generation) = failed_generation {
+                        self.invalidate(generation);
+                    }
+                }
+                Command::Shutdown { reply } => {
+                    self.stop().await;
+                    _ = reply.send(());
+                    return;
+                }
+            }
+        }
+        self.stop().await;
+    }
+
+    async fn enqueue(&mut self, request_id: u64, messages: Vec<Bytes>) -> EnqueueResult {
+        if let Some(current) = &self.writer
+            && let Some(previous) = self
+                .pending
+                .get(&request_id)
+                .filter(|previous| previous.generation == current.generation)
+        {
+            return Ok((current.generation, previous.acks.clone()));
+        }
+
+        let current = match &mut self.writer {
+            Some(current) => current,
             None => {
                 let writer = self
                     .client
+                    .get()
+                    .await?
                     .topic_client()
                     .create_writer_with_params(self.options.clone())
                     .await
                     .map_err(|source| YdbTopicError::CreateWriter { source })?;
-                let writer = Arc::new(writer);
-                *guard = Some(Arc::clone(&writer));
-                writer
+                self.next_generation += 1;
+                self.writer.insert(CurrentWriter {
+                    generation: self.next_generation,
+                    writer,
+                })
             }
         };
+        let generation = current.generation;
 
         let mut acks = Vec::with_capacity(messages.len());
         for body in messages {
-            match writer
-                .write_with_ack_future(TopicWriterMessage::new(body.to_vec()))
+            match current
+                .writer
+                .write_with_ack_future(TopicWriterMessage::new(Vec::from(body)))
                 .await
             {
                 Ok(ack) => acks.push(ack),
                 Err(source) => {
-                    *guard = None;
+                    self.invalidate(generation);
                     return Err(YdbTopicError::Write { source });
                 }
             }
         }
-        drop(guard);
 
-        if let Err(source) = futures::future::try_join_all(acks).await {
-            let mut guard = self.writer.lock().await;
-            if guard
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &writer))
-            {
-                *guard = None;
-            }
-            return Err(YdbTopicError::Write { source });
+        let acks = futures::future::try_join_all(acks)
+            .map(|result| result.map(|_| ()))
+            .boxed()
+            .shared();
+
+        self.pending
+            .retain(|id, _| id.saturating_add(MAX_PENDING_REQUESTS) > request_id);
+        self.pending.insert(
+            request_id,
+            PendingRequest {
+                generation,
+                acks: acks.clone(),
+            },
+        );
+        Ok((generation, acks))
+    }
+
+    /// Drops the writer after an error, unless it was already replaced.
+    ///
+    /// Messages of a dropped writer are never acknowledged, so the requests
+    /// that wrote them must write them again when retried.
+    fn invalidate(&mut self, generation: u64) {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            self.writer = None;
         }
+        self.pending
+            .retain(|_, pending| pending.generation != generation);
+    }
 
-        Ok(())
+    async fn stop(&mut self) {
+        self.pending.clear();
+        if let Some(current) = self.writer.take()
+            && let Err(error) = current.writer.stop().await
+        {
+            warn!(message = "Failed to gracefully close YDB topic writer.", %error);
+        }
     }
 }
 
@@ -256,16 +419,35 @@ impl Service<YdbTopicRequest> for YdbTopicService {
     }
 
     fn call(&mut self, request: YdbTopicRequest) -> Self::Future {
-        let inner = Arc::clone(&self.inner);
         let YdbTopicRequest {
-            messages, metadata, ..
+            id: request_id,
+            messages,
+            metadata,
+            ..
         } = request;
+        let bytes_sent = messages.iter().map(Bytes::len).sum();
+        let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
+
+        // Sending here rather than in the returned future keeps the order in
+        // which the driver issues the requests.
+        let (reply, enqueued) = oneshot::channel();
+        let sent = self.commands.send(Command::Enqueue {
+            request_id,
+            messages,
+            reply,
+        });
+        let commands = self.commands.clone();
 
         Box::pin(async move {
-            let bytes_sent = messages.iter().map(Bytes::len).sum();
-            let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
+            sent.map_err(|_| YdbTopicError::Closed)?;
+            let (generation, acks) = enqueued.await.map_err(|_| YdbTopicError::Closed)??;
 
-            inner.write(messages).await?;
+            let result = acks.await;
+            _ = commands.send(Command::Finished {
+                request_id,
+                failed_generation: result.is_err().then_some(generation),
+            });
+            result.map_err(|source| YdbTopicError::Write { source })?;
 
             Ok(YdbTopicResponse {
                 events_byte_size,

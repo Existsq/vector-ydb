@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use super::{
-    request_builder::{YdbTopicEncoder, YdbTopicRequestBuilder},
-    service::{YdbTopicRequest, YdbTopicRetryLogic, YdbTopicService},
+    encoder::YdbTopicEncoder,
+    service::{YdbTopicRetryLogic, YdbTopicService},
 };
 use crate::sinks::prelude::*;
 
@@ -31,26 +33,18 @@ impl YdbTopicSink {
     }
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        let request_builder = YdbTopicRequestBuilder {
-            encoder: YdbTopicEncoder {
-                encoder: self.encoder,
-                transformer: self.transformer,
-            },
-        };
+        let encoder = Arc::new(YdbTopicEncoder {
+            transformer: self.transformer,
+            encoder: self.encoder,
+        });
 
         let result = input
-            .request_builder(default_request_builder_concurrency_limit(), request_builder)
-            .filter_map(|request| async move {
-                match request {
-                    Err(error) => {
-                        emit!(SinkRequestBuildError { error });
-                        None
-                    }
-                    Ok(message) => Some(message),
-                }
-            })
             .batched(self.batch_settings.as_byte_size_config())
-            .map(YdbTopicRequest::new)
+            .concurrent_map(default_request_builder_concurrency_limit(), move |events| {
+                let encoder = Arc::clone(&encoder);
+                Box::pin(async move { encoder.encode_batch(events) })
+            })
+            .filter_map(future::ready)
             .into_driver(self.service)
             .protocol("grpc")
             .run()

@@ -10,7 +10,7 @@
 //! [ydb_topics]: https://ydb.tech/docs/en/concepts/topic
 
 mod config;
-mod request_builder;
+mod encoder;
 mod service;
 mod sink;
 

@@ -622,7 +622,7 @@ generated: components: sinks: ydb_topic: configuration: {
 				required: false
 				type: {
 					string: {
-						default: "none"
+						default: "adaptive"
 						enum: {
 							adaptive: """
 															Concurrency is managed by Vector's [Adaptive Request Concurrency][arc] feature.

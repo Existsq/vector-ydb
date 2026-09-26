@@ -1,10 +1,15 @@
+use vector_lib::codecs::TextSerializerConfig;
 use ydb::YdbError;
 
 use super::{
     config::{ParsedEndpoint, YdbAuthConfig, YdbTopicCodec, YdbTopicSinkConfig, parse_endpoint},
+    encoder::YdbTopicEncoder,
     service::is_retriable,
 };
-use crate::config::ValidatedSink;
+use crate::{
+    config::{SinkConfig, SinkContext, ValidatedSink},
+    sinks::prelude::*,
+};
 
 #[test]
 fn generate_config() {
@@ -132,4 +137,54 @@ fn retriable_errors() {
     assert!(!is_retriable(&YdbError::Custom(
         "codec is not supported".to_owned()
     )));
+}
+
+#[test]
+fn encodes_one_message_per_event() {
+    let encoding = EncodingConfig::from(TextSerializerConfig::default());
+    let encoder = YdbTopicEncoder {
+        transformer: encoding.transformer(),
+        encoder: Encoder::<()>::new(encoding.build().unwrap()),
+    };
+    let events = ["first", "second", "third"]
+        .into_iter()
+        .map(|message| Event::Log(LogEvent::from(message)))
+        .collect();
+
+    let request = encoder.encode_batch(events).expect("request");
+
+    assert_eq!(request.messages, ["first", "second", "third"]);
+    assert_eq!(request.get_metadata().event_count(), 3);
+    assert_eq!(
+        request.get_metadata().request_encoded_size(),
+        "firstsecondthird".len()
+    );
+}
+
+#[test]
+fn encodes_empty_batch_to_nothing() {
+    let encoding = EncodingConfig::from(TextSerializerConfig::default());
+    let encoder = YdbTopicEncoder {
+        transformer: encoding.transformer(),
+        encoder: Encoder::<()>::new(encoding.build().unwrap()),
+    };
+    assert!(encoder.encode_batch(Vec::new()).is_none());
+}
+
+/// Vector must start even if YDB is down: connecting is deferred to the first
+/// request, and only the healthcheck reports the problem.
+#[tokio::test]
+async fn builds_while_ydb_is_unreachable() {
+    let config = config(
+        r#"
+        endpoint: "grpc://127.0.0.1:1/local"
+        topic: "vector"
+        encoding:
+          codec: "json"
+        "#,
+    );
+    let (_sink, healthcheck) = SinkConfig::build(&config, SinkContext::default())
+        .await
+        .expect("sink should build without connecting to YDB");
+    assert!(healthcheck.await.is_err());
 }

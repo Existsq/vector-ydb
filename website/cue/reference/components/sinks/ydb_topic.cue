@@ -52,7 +52,8 @@ components: sinks: ydb_topic: {
 		requirements: [
 			"""
 				The topic must exist before Vector starts writing to it. The healthcheck
-				fails if the topic cannot be described.
+				fails if the topic cannot be described. Vector starts even if YDB is
+				unreachable and connects on the first write.
 				""",
 		]
 		warnings: []
@@ -97,18 +98,27 @@ components: sinks: ydb_topic: {
 				so all messages written by a Vector instance go to the same partition in order. Set
 				`partition_id` to write to a specific partition instead.
 
-				Only one request is in flight by default (`request.concurrency` is `1`), which keeps
-				the order of events in the topic. Increasing the concurrency improves throughput but
-				the order of batches is no longer guaranteed.
+				Several batches can be in flight at once (see `request.concurrency`), but they are
+				always handed to the write session in the order they were produced, so the order of
+				events in the topic matches the order in which Vector received them. The order can
+				only change when a batch is retried after the write session fails and has to be
+				recreated. Set `request.concurrency` to `none` to rule this out at the cost of
+				throughput.
 				"""
 		}
 		delivery_guarantees: {
 			title: "Delivery guarantees"
 			body: """
 				Events are acknowledged only after YDB confirms that every message of the batch is
-				written. Failed batches are retried, which may write some messages more than once.
-				Set a stable `producer_id` so that YDB can deduplicate messages that the writer
-				resends after a reconnect.
+				written.
+
+				Short outages, restarts and reconnects are handled within the write session: pending
+				messages are resent with their original sequence numbers, so YDB deduplicates them.
+				When a request times out, its messages stay in the write session and a retry waits for
+				them instead of writing them again. Only when the write session itself fails and has
+				to be recreated are the unconfirmed messages written again, which may produce
+				duplicates. Set a stable `producer_id` so that sequence numbers continue across
+				restarts of Vector.
 				"""
 		}
 		authentication: {
