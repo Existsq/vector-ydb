@@ -497,6 +497,7 @@ thread_local = { version = "1.1.9", default-features = false, optional = true }
 typetag = { version = "0.2.20", default-features = false }
 url.workspace = true
 warp = { version = "0.3.7", default-features = false }
+ydb = { version = "0.18.2", default-features = false, optional = true }
 zstd.workspace = true
 arr_macro = { version = "0.2.1" }
 
@@ -937,6 +938,7 @@ sinks-logs = [
   "sinks-webhdfs",
   "sinks-websocket",
   "sinks-websocket_server",
+  "sinks-ydb_topic",
 ]
 sinks-metrics = [
   "sinks-appsignal",
@@ -1010,6 +1012,7 @@ sinks-utils-udp = []
 sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket_server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
+sinks-ydb_topic = ["dep:ydb"]
 sinks-webhdfs = ["dep:opendal", "dep:opendal-http-transport-reqwest"]
 
 # Identifies that the build is a nightly build
@@ -1058,6 +1061,7 @@ all-integration-tests = [
   "vector-api-tests",
   "webhdfs-integration-tests",
   "windows-event-log-integration-tests",
+  "ydb-integration-tests",
 ]
 
 amqp-integration-tests = ["sources-amqp", "sinks-amqp"]
@@ -1127,6 +1131,7 @@ splunk-integration-tests = ["sinks-splunk_hec"]
 dnstap-integration-tests = ["sources-dnstap", "dep:bollard"]
 webhdfs-integration-tests = ["sinks-webhdfs"]
 windows-event-log-integration-tests = ["sources-windows_event_log-integration-tests"]
+ydb-integration-tests = ["sinks-ydb_topic"]
 disable-resolv-conf = []
 shutdown-tests = ["api", "sinks-blackhole", "sinks-console", "sinks-prometheus", "sources", "transforms-lua", "transforms-remap"]
 cli-tests = ["sinks-blackhole", "sinks-socket", "sources-demo_logs", "sources-file", "transforms-remap", "transforms-filter", "transforms-aws_ec2_metadata"]

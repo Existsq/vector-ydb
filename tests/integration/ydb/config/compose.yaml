@@ -1,0 +1,15 @@
+version: "3"
+
+services:
+  ydb:
+    image: ghcr.io/ydb-platform/local-ydb:${CONFIG_VERSION}
+    hostname: ydb
+    environment:
+      - GRPC_PORT=2136
+      - YDB_USE_IN_MEMORY_PDISKS=true
+      - YDB_DEFAULT_LOG_LEVEL=NOTICE
+
+networks:
+  default:
+    name: ${VECTOR_NETWORK}
+    external: true
