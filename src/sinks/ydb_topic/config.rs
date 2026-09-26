@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use futures::FutureExt;
 use snafu::Snafu;
@@ -10,6 +10,7 @@ use ydb::{
 };
 
 use super::{
+    dashboard::{Stats, YdbTopicDashboardConfig},
     service::{YdbTopicRetryLogic, YdbTopicService},
     sink::YdbTopicSink,
 };
@@ -176,6 +177,13 @@ pub struct YdbTopicSinkConfig {
         deserialize_with = "crate::serde::bool_or_struct",
         skip_serializing_if = "crate::serde::is_default"
     )]
+    pub dashboard: YdbTopicDashboardConfig,
+
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::is_default"
+    )]
     pub acknowledgements: AcknowledgementsConfig,
 }
 
@@ -313,7 +321,8 @@ impl ValidatedSink for YdbTopicSinkConfig {
         // right away. Connecting to YDB is deferred to the first request.
         factory.builder()?;
 
-        let writer = YdbTopicService::new(factory, self.writer_options());
+        let stats = Arc::new(Stats::default());
+        let writer = YdbTopicService::new(factory, self.writer_options(), Arc::clone(&stats));
         let healthcheck = healthcheck(writer.clone(), self.topic.clone()).boxed();
         let service = ServiceBuilder::new()
             .settings(request_settings, YdbTopicRetryLogic)
@@ -323,7 +332,16 @@ impl ValidatedSink for YdbTopicSinkConfig {
         let serializer = self.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
 
-        let sink = YdbTopicSink::new(service, writer, batch_settings, transformer, encoder);
+        let dashboard = self.dashboard.enabled.then(|| self.topic.clone());
+        let sink = YdbTopicSink::new(
+            service,
+            writer,
+            batch_settings,
+            transformer,
+            encoder,
+            stats,
+            dashboard,
+        );
 
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }

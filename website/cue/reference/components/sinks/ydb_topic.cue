@@ -106,6 +106,23 @@ components: sinks: ydb_topic: {
 				throughput.
 				"""
 		}
+		batching: {
+			title: "Batching and compression"
+			body: """
+				A batch is sent when it reaches `batch.max_events`, `batch.max_bytes` or
+				`batch.timeout_secs`, whichever comes first. `batch.max_bytes` is compared with the
+				in-memory size of the events, which is several times larger than the encoded
+				message: a 200-byte log line takes about 1 KiB. With short log lines the
+				`batch.max_events` limit is therefore usually reached first.
+
+				Compression (`codec`) is applied to every message separately, so short messages
+				barely shrink: `gzip` saved less than 10% of the traffic on 200-byte log lines while
+				using about twice as much CPU as `raw`. `auto` compresses messages as well and costs
+				as much CPU as `gzip`. Prefer `raw` for short log lines.
+
+				Set `dashboard.enabled` to watch how batches fill up and which limit sends them.
+				"""
+		}
 		delivery_guarantees: {
 			title: "Delivery guarantees"
 			body: """

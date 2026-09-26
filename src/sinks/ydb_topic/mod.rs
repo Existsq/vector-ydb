@@ -10,6 +10,7 @@
 //! [ydb_topics]: https://ydb.tech/docs/en/concepts/topic
 
 mod config;
+mod dashboard;
 mod encoder;
 mod service;
 mod sink;

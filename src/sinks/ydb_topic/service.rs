@@ -14,7 +14,7 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 use tracing::Instrument;
 use ydb::{Client, TopicWriter, TopicWriterMessage, TopicWriterOptions, YdbError};
 
-use super::config::ClientFactory;
+use super::{config::ClientFactory, dashboard::Stats};
 use crate::sinks::prelude::*;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -234,10 +234,15 @@ enum Command {
 pub(super) struct YdbTopicService {
     commands: mpsc::UnboundedSender<Command>,
     client: Arc<LazyClient>,
+    stats: Arc<Stats>,
 }
 
 impl YdbTopicService {
-    pub(super) fn new(factory: ClientFactory, options: TopicWriterOptions) -> Self {
+    pub(super) fn new(
+        factory: ClientFactory,
+        options: TopicWriterOptions,
+        stats: Arc<Stats>,
+    ) -> Self {
         let client = Arc::new(LazyClient {
             factory,
             client: OnceCell::new(),
@@ -249,9 +254,14 @@ impl YdbTopicService {
             writer: None,
             next_generation: 0,
             pending: HashMap::new(),
+            stats: Arc::clone(&stats),
         };
         tokio::spawn(task.run(receiver).in_current_span());
-        Self { commands, client }
+        Self {
+            commands,
+            client,
+            stats,
+        }
     }
 
     /// Returns the YDB client, connecting on first use.
@@ -278,6 +288,7 @@ struct CurrentWriter {
 
 struct PendingRequest {
     generation: u64,
+    messages: usize,
     acks: SharedAcks,
 }
 
@@ -287,6 +298,7 @@ struct WriterTask {
     writer: Option<CurrentWriter>,
     next_generation: u64,
     pending: HashMap<u64, PendingRequest>,
+    stats: Arc<Stats>,
 }
 
 impl WriterTask {
@@ -306,7 +318,9 @@ impl WriterTask {
                     request_id,
                     failed_generation,
                 } => {
-                    self.pending.remove(&request_id);
+                    if let Some(pending) = self.pending.remove(&request_id) {
+                        self.stats.unacked_add(-(pending.messages as i64));
+                    }
                     if let Some(generation) = failed_generation {
                         self.invalidate(generation);
                     }
@@ -343,6 +357,7 @@ impl WriterTask {
                     .await
                     .map_err(|source| YdbTopicError::CreateWriter { source })?;
                 self.next_generation += 1;
+                self.stats.session_opened();
                 self.writer.insert(CurrentWriter {
                     generation: self.next_generation,
                     writer,
@@ -351,7 +366,8 @@ impl WriterTask {
         };
         let generation = current.generation;
 
-        let mut acks = Vec::with_capacity(messages.len());
+        let count = messages.len();
+        let mut acks = Vec::with_capacity(count);
         for body in messages {
             match current
                 .writer
@@ -371,12 +387,13 @@ impl WriterTask {
             .boxed()
             .shared();
 
-        self.pending
-            .retain(|id, _| id.saturating_add(MAX_PENDING_REQUESTS) > request_id);
+        self.forget(|id, _| id.saturating_add(MAX_PENDING_REQUESTS) <= request_id);
+        self.stats.unacked_add(count as i64);
         self.pending.insert(
             request_id,
             PendingRequest {
                 generation,
+                messages: count,
                 acks: acks.clone(),
             },
         );
@@ -394,13 +411,26 @@ impl WriterTask {
             .is_some_and(|current| current.generation == generation)
         {
             self.writer = None;
+            self.stats.session_closed();
         }
-        self.pending
-            .retain(|_, pending| pending.generation != generation);
+        self.forget(|_, pending| pending.generation == generation);
+    }
+
+    /// Removes the pending requests matching `predicate`.
+    fn forget(&mut self, predicate: impl Fn(u64, &PendingRequest) -> bool) {
+        let stats = &self.stats;
+        self.pending.retain(|id, pending| {
+            let forget = predicate(*id, pending);
+            if forget {
+                stats.unacked_add(-(pending.messages as i64));
+            }
+            !forget
+        });
     }
 
     async fn stop(&mut self) {
-        self.pending.clear();
+        self.forget(|_, _| true);
+        self.stats.session_closed();
         if let Some(current) = self.writer.take()
             && let Err(error) = current.writer.stop().await
         {
@@ -426,6 +456,7 @@ impl Service<YdbTopicRequest> for YdbTopicService {
             ..
         } = request;
         let bytes_sent = messages.iter().map(Bytes::len).sum();
+        let count = messages.len();
         let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
 
         // Sending here rather than in the returned future keeps the order in
@@ -437,17 +468,24 @@ impl Service<YdbTopicRequest> for YdbTopicService {
             reply,
         });
         let commands = self.commands.clone();
+        let stats = Arc::clone(&self.stats);
+        stats.request_started();
 
         Box::pin(async move {
-            sent.map_err(|_| YdbTopicError::Closed)?;
-            let (generation, acks) = enqueued.await.map_err(|_| YdbTopicError::Closed)??;
+            let result = async {
+                sent.map_err(|_| YdbTopicError::Closed)?;
+                let (generation, acks) = enqueued.await.map_err(|_| YdbTopicError::Closed)??;
 
-            let result = acks.await;
-            _ = commands.send(Command::Finished {
-                request_id,
-                failed_generation: result.is_err().then_some(generation),
-            });
-            result.map_err(|source| YdbTopicError::Write { source })?;
+                let result = acks.await;
+                _ = commands.send(Command::Finished {
+                    request_id,
+                    failed_generation: result.is_err().then_some(generation),
+                });
+                result.map_err(|source| YdbTopicError::Write { source })
+            }
+            .await;
+            stats.request_finished(count, bytes_sent, result.is_ok());
+            result?;
 
             Ok(YdbTopicResponse {
                 events_byte_size,

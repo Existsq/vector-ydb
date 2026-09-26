@@ -121,6 +121,22 @@ generated: components: sinks: ydb_topic: configuration: {
 			}
 		}
 	}
+	dashboard: {
+		description: "Live dashboard of the sink state."
+		required:    false
+		type: object: options: enabled: {
+			description: """
+				Shows the batch being accumulated, requests in flight, unacknowledged messages and
+				throughput.
+
+				When stderr is a terminal, an animated panel is drawn there; run Vector with `--quiet`
+				to keep log lines from interleaving with it. Otherwise, a summary is logged every
+				10 seconds.
+				"""
+			required: false
+			type: bool: default: false
+		}
+	}
 	encoding: {
 		description: """
 			Encoding configuration.
